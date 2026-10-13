@@ -131,7 +131,7 @@ class _SettingsPageState extends State<SettingsPage> {
           const Padding(
             padding: EdgeInsets.only(top: 16),
             child: Text(
-              'Veexor 2.0\n关闭会话仅移除本机标签；服务端历史仍保留。',
+              'Veexor 2.0.1\n关闭会话仅移除本机标签；服务端历史仍保留。',
               style: TextStyle(color: muted, fontSize: 12),
             ),
           ),

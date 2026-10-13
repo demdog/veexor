@@ -281,6 +281,7 @@ class SessionBook {
           'sample_rate',
           'duration_ms',
           'voice_status',
+          'awaiting_reply',
           'speech_expected',
           'speech_actual',
         ]) {

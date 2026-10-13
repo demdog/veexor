@@ -22,6 +22,125 @@ void main() {
     host.calls.clear();
   });
   tearDown(() => c.dispose());
+  test('first chat persists a precreated recovery ID before posting', () async {
+    const id = 'chat_11111111111111111111111111111111';
+    host.handler = (method, args) async {
+      if (method == 'request' && args['path'] == '/v1/conversations') {
+        return {'conversation_id': id};
+      }
+      if (method == 'request' && args['path'] == '/v1/chat') {
+        final saved = SessionBook.restore(host.saved);
+        expect(saved.active.serverId, id);
+        expect(saved.active.messages.last.data['awaiting_reply'], true);
+        expect(object(args['body'])['conversation_id'], id);
+        expect(object(args['body']).containsKey('new_conversation'), false);
+        return {'conversation_id': id, 'answer': '建模完成'};
+      }
+      return unhandled;
+    };
+    c.active.draft = '建模桌子';
+    await c.sendText();
+    expect(c.active.messages.last.content, '建模完成');
+    expect(c.active.messages.first.data.containsKey('awaiting_reply'), false);
+  });
+  test(
+    'lost response recovers completed answer by GET without reposting',
+    () async {
+      host.handler = (method, args) async {
+        if (method == 'request' && args['path'] == '/v1/chat') {
+          throw TimeoutException('等待回答超时');
+        }
+        if (method == 'request' &&
+            text(args['path']).startsWith('/v1/conversations/')) {
+          return {
+            'person_id': null,
+            'messages': [
+              {'role': 'user', 'content': '建模桌子'},
+              {'role': 'assistant', 'content': '桌子建模完成'},
+            ],
+          };
+        }
+        return unhandled;
+      };
+      c.active.draft = '建模桌子';
+      await c.sendText();
+      expect(c.active.messages.last.content, '桌子建模完成');
+      expect(c.active.messages.first.data.containsKey('awaiting_reply'), false);
+      expect(c.active.notice, contains('未自动重发'));
+      expect(
+        host.calls
+            .where(
+              (call) => call.$1 == 'request' && call.$2['path'] == '/v1/chat',
+            )
+            .length,
+        1,
+      );
+    },
+  );
+  test('empty history preserves pending message and identity, then recovers after restart', () async {
+    var complete = false;
+    host.handler = (method, args) async {
+      if (method == 'request' && args['path'] == '/v1/chat') {
+        throw TimeoutException('等待回答超时');
+      }
+      if (method == 'request' &&
+          text(args['path']).startsWith('/v1/conversations/')) {
+        return {
+          'person_id': complete ? alice : null,
+          'messages': complete
+              ? [
+                  {'role': 'user', 'content': '建模桌子'},
+                  {'role': 'assistant', 'content': '完成'},
+                ]
+              : [],
+        };
+      }
+      return unhandled;
+    };
+    c.choosePerson(const Person(alice, '爸爸'));
+    c.active.draft = '建模桌子';
+    await c.sendText();
+    expect(c.active.messages.length, 1);
+    expect(c.active.personId, alice);
+    expect(c.active.messages.last.data['awaiting_reply'], true);
+    host.boot['sessions'] = c.book.save();
+    c.dispose();
+    complete = true;
+    c = ChatController(host);
+    await c.initialize();
+    await Future<void>.delayed(Duration.zero);
+    expect(c.active.messages.last.content, '完成');
+    expect(
+      host.calls
+          .where(
+            (call) => call.$1 == 'request' && call.$2['path'] == '/v1/chat',
+          )
+          .length,
+      1,
+    );
+  });
+  test(
+    'conversation creation failure keeps draft and never submits chat',
+    () async {
+      host.handler = (method, args) async {
+        if (method == 'request' && args['path'] == '/v1/conversations') {
+          throw TimeoutException('连接服务超时');
+        }
+        return unhandled;
+      };
+      c.active.draft = '添加库存';
+      await c.sendText();
+      expect(c.active.draft, '添加库存');
+      expect(c.active.serverId, '');
+      expect(c.active.notice, contains('聊天尚未发送'));
+      expect(
+        host.calls.where(
+          (call) => call.$1 == 'request' && call.$2['path'] == '/v1/chat',
+        ),
+        isEmpty,
+      );
+    },
+  );
   test(
     'fifth household request keeps its draft while four sessions are busy',
     () async {

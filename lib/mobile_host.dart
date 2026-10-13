@@ -16,6 +16,7 @@ import 'package:record/record.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'host.dart';
+import 'http_policy.dart';
 import 'models.dart';
 import 'omni.dart';
 
@@ -373,9 +374,9 @@ class MobileHost implements Host {
             'Authorization': 'Bearer $token',
             'Accept': 'application/json',
           },
-          connectTimeout: const Duration(seconds: 8),
-          receiveTimeout: const Duration(seconds: 390),
-          sendTimeout: const Duration(seconds: 30),
+          connectTimeout: homeConnectTimeout,
+          receiveTimeout: homeAnswerTimeout,
+          sendTimeout: homeSendTimeout,
           followRedirects: false,
         ),
       );
@@ -414,22 +415,7 @@ class MobileHost implements Host {
         }
         return jsonDecode(utf8.decode(bytes));
       } on DioException catch (error) {
-        if (CancelToken.isCancel(error)) {
-          throw const HttpException('请求已停止，服务端结果需另行查询');
-        }
-        if ([401, 403].contains(error.response?.statusCode)) {
-          throw const HttpException('访问令牌无效或无权限，请检查设置');
-        }
-        if ([
-          DioExceptionType.receiveTimeout,
-          DioExceptionType.sendTimeout,
-        ].contains(error.type)) {
-          throw TimeoutException('请求超时，结果未知。可同步历史；涉及电器时先查询状态。');
-        }
-        if (error.response?.statusCode != null) {
-          throw HttpException('服务返回 HTTP ${error.response!.statusCode}，未自动重试');
-        }
-        throw const HttpException('无法连接服务，请检查家庭 Wi-Fi 和服务地址');
+        throw householdFailure(error);
       } finally {
         dio.close(force: true);
       }

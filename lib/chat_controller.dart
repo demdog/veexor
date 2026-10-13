@@ -50,6 +50,10 @@ class ChatController extends ChangeNotifier {
 
   bool _owns(Session s, int profile) =>
       !_disposed && profile == _profile && identical(book.find(s.id), s);
+  bool _needsHistory(Session s) =>
+      !s.loaded ||
+      !s.identityKnown ||
+      s.messages.any((m) => m.data['awaiting_reply'] == true);
   Future<void> initialize() async {
     try {
       final boot = object(await host.call('bootstrap'));
@@ -65,7 +69,7 @@ class ChatController extends ChangeNotifier {
       if (config.token.isNotEmpty) {
         unawaited(checkConnection());
         unawaited(people().catchError((_) => <Person>[]));
-        if (!active.loaded || !active.identityKnown) {
+        if (_needsHistory(active)) {
           unawaited(loadHistory(active));
         }
       }
@@ -156,7 +160,7 @@ class ChatController extends ChangeNotifier {
     book.selected = id;
     save();
     refresh();
-    if (!active.loaded || !active.identityKnown) unawaited(loadHistory(active));
+    if (_needsHistory(active)) unawaited(loadHistory(active));
   }
 
   void create() {
@@ -172,7 +176,7 @@ class ChatController extends ChangeNotifier {
     book.close(id);
     save();
     refresh();
-    if (!active.loaded || !active.identityKnown) unawaited(loadHistory(active));
+    if (_needsHistory(active)) unawaited(loadHistory(active));
   }
 
   void draft(String value) {
@@ -258,9 +262,8 @@ class ChatController extends ChangeNotifier {
     String kind, [
     Message? existing,
   ]) async {
-    final profile = _profile,
-        conversation = session.serverId,
-        person = session.personId;
+    final profile = _profile, person = session.personId;
+    var conversation = session.serverId;
     if (!session.identityKnown) return;
     if (value.isEmpty && session.photos.isNotEmpty) value = '请识别照片中的物品。';
     if (value.length > 4000) {
@@ -308,7 +311,36 @@ class ChatController extends ChangeNotifier {
         save();
       }
       if (!_owns(session, profile)) return;
+      if (conversation.isEmpty) {
+        session.notice = '正在创建会话…';
+        refresh();
+        final created = object(
+          await request(
+            '/v1/conversations',
+            method: 'POST',
+            id: '${session.id}_create',
+          ),
+        );
+        if (!_owns(session, profile)) return;
+        conversation = text(created['conversation_id'] ?? created['id']);
+        if (!RegExp(r'^chat_[a-f0-9]{32}$').hasMatch(conversation)) {
+          throw const FormatException('无法取得会话编号，聊天尚未发送');
+        }
+        session.serverId = conversation;
+        // Persist the recovery address before a side-effecting chat is submitted.
+        await host.call('saveState', {
+          'state': book.save(),
+          'voice_mode': config.voiceMode,
+        });
+        if (!_owns(session, profile)) return;
+      }
       final body = chatRequest(value, photos, conversation, person);
+      message.data['awaiting_reply'] = true;
+      await host.call('saveState', {
+        'state': book.save(),
+        'voice_mode': config.voiceMode,
+      });
+      if (!_owns(session, profile)) return;
       submitted = true;
       session.notice = photos.isEmpty ? '正在等待回复…' : '正在识别照片并回答…';
       refresh();
@@ -329,6 +361,7 @@ class ChatController extends ChangeNotifier {
       session.busy = false;
       session.notice = '';
       message.data.remove('voice_status');
+      message.data.remove('awaiting_reply');
       final answer = session.add('assistant', text(reply['answer']), kind);
       for (final field in ['items', 'devices', 'scene_tasks']) {
         if (reply[field] is List) answer.data[field] = reply[field];
@@ -344,6 +377,11 @@ class ChatController extends ChangeNotifier {
       session.notice = submitted
           ? '${readable(e)}；结果需从历史确认，未自动重发。'
           : readable(e);
+      if (!submitted) {
+        message.data.remove('awaiting_reply');
+        if (existing == null && session.draft.isEmpty) session.draft = value;
+        session.notice = '聊天尚未发送。${readable(e)}';
+      }
       if (!submitted && photos.isNotEmpty) {
         session.photos = photos;
         if (session.draft.isEmpty) session.draft = value;
@@ -352,14 +390,27 @@ class ChatController extends ChangeNotifier {
       if (kind == 'voice') message.data['voice_status'] = session.notice;
       save(immediately: true);
       refresh();
+      if (submitted && session.serverId.isNotEmpty) {
+        await loadHistory(session, pending: message, failure: readable(e));
+      }
     }
   }
 
-  Future<void> loadHistory(Session session) async {
+  Future<void> loadHistory(
+    Session session, {
+    Message? pending,
+    String? failure,
+  }) async {
     if (session.busy || session.serverId.isEmpty) return;
+    pending ??= session.messages
+        .where((m) => m.data['awaiting_reply'] == true)
+        .lastOrNull;
+    if (pending != null) failure ??= '上次回答接收未完成';
     final profile = _profile;
     session.busy = true;
-    session.notice = '正在同步历史…';
+    session.notice = pending == null
+        ? '正在同步历史…'
+        : '${failure ?? '结果未知'}；正在查询历史，未自动重发。';
     refresh();
     try {
       final all = <Json>[];
@@ -376,6 +427,10 @@ class ChatController extends ChangeNotifier {
         if (page.length < 100) break;
         if (offset == 900) throw const FormatException('对话超过 1000 条，请开启新会话');
       }
+      if (pending != null && all.isEmpty) {
+        session.notice = '${failure ?? '结果未知'}；服务端暂未保存回答，请稍后同步历史，未自动重发。';
+        return;
+      }
       final meta = object(metadata), nested = object(meta['conversation']);
       if (meta.containsKey('person_id') ||
           nested.containsKey('person_id') ||
@@ -383,12 +438,36 @@ class ChatController extends ChangeNotifier {
         book.applyIdentity(session, metadata);
       }
       book.replaceHistory(session, all);
+      if (pending != null &&
+          !session.messages.any((m) => m.id == pending!.id)) {
+        session.messages.add(pending);
+        if (session.messages.length > 200) {
+          session.messages.removeRange(0, session.messages.length - 200);
+        }
+      }
+      if (pending != null) {
+        final index = session.messages.indexWhere((m) => m.id == pending!.id);
+        if (index >= 0 &&
+            index + 1 < session.messages.length &&
+            session.messages[index + 1].role == 'assistant') {
+          session.messages[index].data.remove('awaiting_reply');
+          session.messages[index].data.remove('voice_status');
+          session.messages[index + 1].data['kind'] = pending.kind;
+        }
+      }
       session.loaded = true;
       session.notice = session.identityKnown
           ? (all.length > 200 ? '已显示最近 200 条消息' : '')
           : '此历史未返回身份。可查看消息；请选择身份开启新会话。';
+      if (pending != null) {
+        session.notice = '${failure ?? '结果未知'}；已同步历史，请核对回答，未自动重发。';
+      }
     } catch (e) {
-      if (_owns(session, profile)) session.notice = readable(e);
+      if (_owns(session, profile)) {
+        session.notice = pending == null
+            ? readable(e)
+            : '${failure ?? '结果未知'}；历史恢复失败：${readable(e)}。请稍后同步历史，未自动重发。';
+      }
     } finally {
       if (_owns(session, profile)) {
         session.busy = false;

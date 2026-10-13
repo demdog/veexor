@@ -35,6 +35,10 @@ class FakeHost implements Host {
         saved = text(arguments['state']);
         return null;
       case 'request':
+        if (arguments['path'] == '/v1/conversations' &&
+            arguments['method'] == 'POST') {
+          return {'conversation_id': 'chat_${newId().replaceAll('-', '')}'};
+        }
         if (arguments['path'] == '/v1/status') {
           return {'llm_configured': true, 'isaac_online': true};
         }

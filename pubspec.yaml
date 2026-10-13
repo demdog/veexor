@@ -1,7 +1,7 @@
 name: veexor
 description: Veexor 家庭聊天助手，支持 Android 和 iOS
 publish_to: none
-version: 2.0.0+14
+version: 2.0.1+15
 environment:
   sdk: '>=3.13.0 <4.0.0'
 dependencies:
